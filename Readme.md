@@ -35,3 +35,42 @@ Deepfake detection app/
 │   └── generatereport.py
 ├── Dockerfile              # Docker build file
 ├── requirements.txt        # Dependency list
+
+---
+
+## 🚀 Getting Started
+1️⃣ Install Dependencies
+Make sure you’re using Python 3.10+:
+```plaintext
+pip install -r requirements.txt
+2️⃣ Run the Streamlit App
+```plaintext
+streamlit run app.py
+3️⃣ Run the FastAPI Backend
+```plaintext
+uvicorn main:app --reload
+
+---
+
+##🧪 Evaluation
+To test the model and generate performance metrics:
+```plaintext
+python evaluate.py
+
+---
+
+##🤖 Models Used
+```plaintext
+| Modality | Model(s)                   |
+| -------- | -------------------------- |
+| Visual   | EfficientNetB4             |
+| Audio    | Whisper, SyncNet           |
+| Text     | EasyOCR, BERT              |
+| Fusion   | Cross-Modal Attention, GNN |
+| Semantic | CLIP                       |
+
+---
+
+##✍️ Author
+Built by Ayomide Olayode for a final year research project on AI-driven deepfake detection.
+
