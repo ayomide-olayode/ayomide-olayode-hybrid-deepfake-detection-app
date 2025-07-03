@@ -1,0 +1,43 @@
+# Ignore virtual environment
+venv/
+.env/
+.venv/
+ENV/
+env/
+
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# C extensions
+*.so
+
+# Jupyter Notebook checkpoints
+.ipynb_checkpoints
+
+# PyInstaller
+dist/
+build/
+*.spec
+
+# VS Code / PyCharm settings
+.vscode/
+.idea/
+
+# Logs and local files
+*.log
+*.tmp
+
+# System files
+.DS_Store
+Thumbs.db
+
+# Ignore model cache or large artifacts
+model_cache/
+*.pt
+*.pth
+*.ckpt
+
+# Ignore data folders (if any)
+data/
