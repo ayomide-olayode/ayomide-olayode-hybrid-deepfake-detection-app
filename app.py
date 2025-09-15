@@ -1,545 +1,576 @@
+"""
+Streamlit web application for HybridDeepfakeDetector.
+Provides an interactive interface for uploading videos and getting deepfake predictions.
+"""
+
 import streamlit as st
-import requests
-import tempfile
 import os
-from pathlib import Path
-import json
-import cv2
+import sys
+import tempfile
 import time
+from pathlib import Path
+import logging
+from typing import Dict, Tuple, Optional
+
+import torch
 import numpy as np
-import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
-from sklearn.metrics import confusion_matrix, roc_curve, auc
-import csv
-from datetime import datetime
-from io import BytesIO
+from PIL import Image
+import cv2
 
-# Backend API URL
-BACKEND_URL = "http://localhost:8000"
+# Add src to path for imports
+sys.path.append(str(Path(__file__).parent / "src"))
 
-# Configure Streamlit page
+from src.config import config
+from src.models.hybrid_model import create_model, get_model_config
+from src.utils.data_utils import VideoProcessor, AudioProcessor
+from src.utils.model_utils import ModelCheckpoint
+from src.datasets.deepfake_dataset import DeepfakeDataset
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Page configuration
 st.set_page_config(
-    page_title="Deepfake Detection App",
+    page_title="Hybrid Deepfake Detector",
     page_icon="🔍",
-    layout="wide"
+    layout="wide",
+    initial_sidebar_state="expanded"
 )
 
-def get_video_duration(video_path):
-    """Get video duration in seconds"""
-    cap = cv2.VideoCapture(video_path)
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    frame_count = cap.get(cv2.CAP_PROP_FRAME_COUNT)
-    duration = frame_count / fps if fps > 0 else 0
-    cap.release()
-    return duration
-
-def analyze_video_api(video_path, enable_video, enable_audio, enable_text, threshold, fusion_method):
-    """Call backend API for analysis"""
-    try:
-        # Prepare request data
-        with open(video_path, 'rb') as f:
-            files = {'file': f}
-            data = {
-                'enable_video': str(enable_video),
-                'enable_audio': str(enable_audio),
-                'enable_text': str(enable_text),
-                'confidence_threshold': str(threshold),
-                'fusion_method': fusion_method
-            }
-            
-            # Call backend API
-            response = requests.post(
-                f"{BACKEND_URL}/analyze/multimodal",
-                files=files,
-                data=data
-            )
-            
-            if response.status_code != 200:
-                st.error(f"API error: {response.status_code} - {response.text}")
-                return None
-            
-            return response.json()
-    
-    except Exception as e:
-        st.error(f"API communication failed: {str(e)}")
-        return None
-
-def save_results_to_csv(video_path, results, fused_results, threshold):
-    """Save analysis results to CSV for chapter 4"""
-    filename = "chapter4_results.csv"
-    file_exists = os.path.isfile(filename)
-    
-    with open(filename, 'a', newline='') as csvfile:
-        fieldnames = [
-            'timestamp', 'video_file', 'duration', 
-            'video_confidence', 'audio_confidence', 'text_confidence',
-            'final_confidence', 'is_deepfake', 'threshold',
-            'modalities_used', 'fusion_method'
-        ]
-        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
-        
-        if not file_exists:
-            writer.writeheader()
-        
-        writer.writerow({
-            'timestamp': datetime.now().isoformat(),
-            'video_file': os.path.basename(video_path),
-            'duration': get_video_duration(video_path),
-            'video_confidence': results.get('video', {}).get('confidence', 0.5),
-            'audio_confidence': results.get('audio', {}).get('confidence', 0.5),
-            'text_confidence': results.get('text', {}).get('confidence', 0.5),
-            'final_confidence': fused_results['confidence'],
-            'is_deepfake': fused_results['confidence'] > threshold,
-            'threshold': threshold,
-            'modalities_used': ','.join(results.keys()),
-            'fusion_method': fused_results.get('method', '')
-        })
-
-def display_video_results(results):
-    """Display video-specific results"""
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        frames_analyzed = results.get('frames_analyzed', 0)
-        st.metric("Frames Analyzed", frames_analyzed)
-    
-    with col2:
-        avg_prob = results.get('average_fake_probability', 0)
-        st.metric("Avg Deepfake Prob", f"{avg_prob:.2%}")
-    
-    with col3:
-        temporal_consistency = results.get('temporal_analysis', {}).get('temporal_consistency', 0)
-        st.metric("Temporal Consistency", f"{temporal_consistency:.2%}")
-    
-    # Show eye blink analysis
-    blink_rate = results.get('eye_blink_analysis', {}).get('blink_rate', 0)
-    st.write(f"**Eye Blink Rate:** {blink_rate:.2f} (normal: 0.1-0.2)")
-
-def display_audio_results(results):
-    """Display audio-specific results"""
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        duration = results.get('duration', 0)
-        st.metric("Duration", f"{duration:.1f}s")
-    
-    with col2:
-        naturalness = results.get('speech_analysis', {}).get('naturalness_score', 0)
-        st.metric("Speech Naturalness", f"{naturalness:.2%}")
-    
-    with col3:
-        transcription = results.get('transcription', {})
-        word_count = len(transcription.get('text', '').split())
-        st.metric("Words Transcribed", word_count)
-    
-    # Show artifact detection
-    artifacts = results.get('artifacts', {})
-    st.write("**Audio Artifacts Detected:**")
-    st.write(f"- Phase Anomalies: {artifacts.get('phase_anomalies', 0):.2%}")
-    st.write(f"- Spectral Gaps: {artifacts.get('spectral_gaps', 0):.2%}")
-
-def display_text_results(results):
-    """Display text-specific results"""
-    col1, col2, col3 = st.columns(3)
-    
-    with col1:
-        word_count = results.get('word_count', 0)
-        st.metric("Words Analyzed", word_count)
-    
-    with col2:
-        semantic_score = results.get('semantic_analysis', {}).get('consistency_score', 0)
-        st.metric("Semantic Consistency", f"{semantic_score:.2%}")
-    
-    with col3:
-        clip_score = results.get('clip_analysis', {}).get('consistency_score', 0)
-        st.metric("Visual-Text Alignment", f"{clip_score:.2%}")
-    
-    # Show detected text if available
-    ocr_results = results.get('ocr_results', {})
-    all_texts = ocr_results.get('all_texts', [])
-    if all_texts:
-        st.write("**Detected Text in Video:**")
-        for i, text in enumerate(all_texts[:3]):  # Show first 3
-            st.write(f"{i+1}. {text}")
-
-def display_multimodal_results(results, fused_results, analysis_times, fusion_time, threshold, fusion_method):
-    """Display comprehensive multi-modal results"""
-    
-    st.subheader("🎯 Multi-Modal Analysis Results")
-    
-    # Overall result
-    final_confidence = fused_results['confidence']
-    is_deepfake = final_confidence > threshold
-    consistency = fused_results.get('consistency_score', 0.5)
-    
-    # Main result display
-    col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
-    
-    with col1:
-        if is_deepfake:
-            if final_confidence > 0.8:
-                st.error(f"🚨 **HIGH PROBABILITY DEEPFAKE**")
-            elif final_confidence > 0.6:
-                st.warning(f"⚠️ **LIKELY DEEPFAKE DETECTED**")
-            else:
-                st.warning(f"⚠️ **POSSIBLE DEEPFAKE**")
-        else:
-            if final_confidence < 0.2:
-                st.success(f"✅ **HIGHLY LIKELY AUTHENTIC**")
-            elif final_confidence < 0.4:
-                st.success(f"✅ **LIKELY AUTHENTIC**")
-            else:
-                st.info(f"ℹ️ **UNCERTAIN - NEEDS REVIEW**")
-    
-    with col2:
-        st.metric("Final Confidence", f"{final_confidence:.1%}")
-        if final_confidence > 0.7:
-            st.caption("🔴 High Risk")
-        elif final_confidence > 0.4:
-            st.caption("🟡 Medium Risk")
-        else:
-            st.caption("🟢 Low Risk")
-    
-    with col3:
-        st.metric("Model Consistency", f"{consistency:.1%}")
-        if consistency > 0.8:
-            st.caption("🟢 High Agreement")
-        elif consistency > 0.6:
-            st.caption("🟡 Moderate Agreement")
-        else:
-            st.caption("🔴 Low Agreement")
-    
-    with col4:
-        total_time = sum(analysis_times.values()) + fusion_time
-        st.metric("Total Time", f"{total_time:.1f}s")
-        st.caption(f"Fusion: {fusion_method}")
-    
-    # Individual model results
-    st.subheader("📊 Individual Model Results")
-    
-    individual_confidences = {}
-    if 'video' in results:
-        individual_confidences['video'] = results['video'].get('confidence', 0.5)
-    if 'audio' in results:
-        individual_confidences['audio'] = results['audio'].get('confidence', 0.5)
-    if 'text' in results:
-        individual_confidences['text'] = results['text'].get('confidence', 0.5)
-    
-    if individual_confidences:
-        # Create columns for each enabled model
-        model_cols = st.columns(len(individual_confidences))
-        
-        for i, (modality, confidence) in enumerate(individual_confidences.items()):
-            with model_cols[i]:
-                # Model icon and name
-                icons = {'video': '🎬', 'audio': '🎵', 'text': '📝'}
-                names = {'video': 'Video Analysis', 'audio': 'Audio Analysis', 'text': 'Text Analysis'}
-                
-                st.metric(
-                    f"{icons.get(modality, '🔍')} {names.get(modality, modality.title())}",
-                    f"{confidence:.1%}",
-                    f"{analysis_times.get(modality, 0):.1f}s"
-                )
-                
-                # Individual assessment
-                if confidence > 0.6:
-                    st.caption("🔴 Suspicious")
-                elif confidence > 0.4:
-                    st.caption("🟡 Uncertain")
-                else:
-                    st.caption("🟢 Likely Real")
-    
-    # Detailed results for each modality
-    for modality, result in results.items():
-        if modality == 'video':
-            with st.expander(f"🎬 Video Analysis Details"):
-                display_video_results(result)
-        elif modality == 'audio':
-            with st.expander(f"🎵 Audio Analysis Details"):
-                display_audio_results(result)
-        elif modality == 'text':
-            with st.expander(f"📝 Text Analysis Details"):
-                display_text_results(result)
-    
-    # Fusion analysis
-    with st.expander("🔗 Fusion Analysis"):
-        st.write(f"**Fusion Method:** {fusion_method}")
-        st.write(f"**Number of Modalities:** {len(individual_confidences)}")
-        st.write(f"**Consistency Score:** {consistency:.2%}")
-        
-        if individual_confidences:
-            st.write("**Individual Confidence Scores:**")
-            for modality, confidence in individual_confidences.items():
-                st.write(f"- {modality.title()}: {confidence:.2%}")
-            
-            # Show agreement/disagreement
-            conf_values = list(individual_confidences.values())
-            max_diff = max(conf_values) - min(conf_values)
-            st.write(f"**Confidence Range:** {max_diff:.2%}")
-            
-            if max_diff < 0.2:
-                st.success("✅ Models show strong agreement")
-            elif max_diff < 0.4:
-                st.warning("⚠️ Models show moderate disagreement")
-            else:
-                st.error("🚨 Models show significant disagreement - manual review recommended")
-    
-    # Add interpretation guide
-    with st.expander("📖 How to Interpret Multi-Modal Results"):
-        st.write("""
-        **Multi-Modal Analysis Benefits:**
-        - **Higher Accuracy**: Combines evidence from video, audio, and text
-        - **Robustness**: Less likely to be fooled by single-modality attacks
-        - **Confidence Assessment**: Model agreement indicates result reliability
-        
-        **Fusion Methods:**
-        - **Weighted Average**: Balances all models with video given highest weight
-        - **Maximum Confidence**: Takes the most suspicious result
-        - **Consensus Voting**: Requires majority agreement for deepfake detection
-        - **Advanced Fusion**: Uses cross-modal consistency and validation
-        
-        **Consistency Score:**
-        - **High (>80%)**: All models agree - high confidence in result
-        - **Medium (60-80%)**: Some disagreement - moderate confidence
-        - **Low (<60%)**: Significant disagreement - manual review recommended
-        """)
-    
-    # Download comprehensive report
-    report = {
-        "final_confidence": final_confidence,
-        "is_deepfake": is_deepfake,
-        "modality_results": results,
-        "fusion_method": fusion_method,
-        "analysis_times": analysis_times,
-        "fusion_time": fusion_time,
-        "threshold": threshold
+# Custom CSS for better styling
+st.markdown("""
+<style>
+    .main-header {
+        font-size: 3rem;
+        font-weight: bold;
+        text-align: center;
+        color: #1f77b4;
+        margin-bottom: 2rem;
     }
-    st.download_button(
-        "📄 Download Comprehensive Report",
-        data=json.dumps(report, indent=2),
-        file_name=f"multimodal_deepfake_analysis_report.json",
-        mime="application/json"
-    )
     
-    # Chapter 4 report button
-    if st.button("📊 Generate Chapter 4 Report"):
-        generate_chapter4_report()
+    .prediction-box {
+        padding: 1rem;
+        border-radius: 10px;
+        text-align: center;
+        font-size: 1.5rem;
+        font-weight: bold;
+        margin: 1rem 0;
+    }
+    
+    .real-prediction {
+        background-color: #d4edda;
+        color: #155724;
+        border: 2px solid #c3e6cb;
+    }
+    
+    .fake-prediction {
+        background-color: #f8d7da;
+        color: #721c24;
+        border: 2px solid #f5c6cb;
+    }
+    
+    .confidence-bar {
+        height: 20px;
+        border-radius: 10px;
+        margin: 0.5rem 0;
+    }
+    
+    .processing-step {
+        padding: 0.5rem;
+        margin: 0.25rem 0;
+        border-radius: 5px;
+        background-color: #f8f9fa;
+        border-left: 4px solid #007bff;
+    }
+    
+    .step-complete {
+        background-color: #d4edda;
+        border-left-color: #28a745;
+    }
+    
+    .step-error {
+        background-color: #f8d7da;
+        border-left-color: #dc3545;
+    }
+</style>
+""", unsafe_allow_html=True)
 
-def generate_chapter4_report():
-    """Generate performance report for Chapter 4"""
-    try:
-        # Load collected data
-        df = pd.read_csv('chapter4_results.csv')
-        
-        if df.empty:
-            st.warning("No analysis data available. Please analyze some videos first.")
-            return
-        
-        # Basic statistics
-        stats = {
-            "total_videos": len(df),
-            "deepfake_ratio": df['is_deepfake'].mean(),
-            "avg_confidence": df['final_confidence'].mean(),
-            "modality_usage": df['modalities_used'].value_counts().to_dict()
-        }
-        
-        # Confusion Matrix
-        y_true = df['is_deepfake'].astype(int)
-        y_pred = (df['final_confidence'] > 0.5).astype(int)
-        cm = confusion_matrix(y_true, y_pred)
-        
-        # ROC Curve
-        fpr, tpr, _ = roc_curve(y_true, df['final_confidence'])
-        roc_auc = auc(fpr, tpr)
-        
-        # Create plots
-        fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(15, 12))
-        
-        # Confusion Matrix Plot
-        sns.heatmap(cm, annot=True, fmt='d', cmap='Blues', ax=ax1)
-        ax1.set_title('Confusion Matrix')
-        ax1.set_xlabel('Predicted')
-        ax1.set_ylabel('Actual')
-        
-        # ROC Curve Plot
-        ax2.plot(fpr, tpr, color='darkorange', lw=2, label=f'ROC curve (AUC = {roc_auc:.2f})')
-        ax2.plot([0, 1], [0, 1], color='navy', lw=2, linestyle='--')
-        ax2.set_xlabel('False Positive Rate')
-        ax2.set_ylabel('True Positive Rate')
-        ax2.set_title('Receiver Operating Characteristic')
-        ax2.legend(loc="lower right")
-        
-        # Confidence Distribution
-        sns.histplot(df['final_confidence'], bins=20, kde=True, ax=ax3)
-        ax3.set_title('Confidence Score Distribution')
-        ax3.set_xlabel('Confidence Score')
-        
-        # Modality Performance
-        modality_data = []
-        for mod in ['video', 'audio', 'text']:
-            if mod + '_confidence' in df.columns:
-                modality_data.append({
-                    'Modality': mod,
-                    'Accuracy': ((df[mod + '_confidence'] > 0.5) == df['is_deepfake']).mean()
-                })
-        modality_df = pd.DataFrame(modality_data)
-        if not modality_df.empty:
-            sns.barplot(x='Modality', y='Accuracy', data=modality_df, ax=ax4)
-            ax4.set_title('Modality Accuracy Comparison')
-        
-        plt.tight_layout()
-        
-        # Display in Streamlit
-        st.subheader("Chapter 4: Performance Report")
-        
-        col1, col2 = st.columns(2)
-        with col1:
-            st.write("**Summary Statistics:**")
-            st.write(f"- Total Videos Analyzed: {stats['total_videos']}")
-            st.write(f"- Deepfake Detection Ratio: {stats['deepfake_ratio']:.2%}")
-            st.write(f"- Average Confidence: {stats['avg_confidence']:.2f}")
-            
-            st.write("\n**Modality Usage:**")
-            for mod, count in stats['modality_usage'].items():
-                st.write(f"- {mod}: {count} videos")
-        
-        with col2:
-            st.pyplot(fig)
-        
-        # Download report data
-        st.download_button(
-            "📊 Download Full Report Data",
-            data=df.to_csv(index=False),
-            file_name="deepfake_analysis_full_dataset.csv",
-            mime="text/csv"
-        )
+class DeepfakeDetectorApp:
+    """Main application class for the Streamlit interface."""
     
-    except Exception as e:
-        st.error(f"Error generating Chapter 4 report: {str(e)}")
-
-def main():
-    st.title("🔍 Multi-Modal Deepfake Detection System")
-    st.markdown("Upload a video file (max 30 seconds) to analyze for potential deepfake content using combined AI models.")
-    
-    # Configuration
-    st.sidebar.header("Analysis Settings")
-    confidence_threshold = st.sidebar.slider("Confidence Threshold", 0.0, 1.0, 0.5)
-    max_duration = st.sidebar.number_input("Max Video Duration (seconds)", 1, 30, 30)
-    
-    # Multi-modal analysis options
-    st.sidebar.header("Multi-Modal Analysis")
-    enable_video = st.sidebar.checkbox("Video Analysis (EfficientNet)", value=True)
-    enable_audio = st.sidebar.checkbox("Audio Analysis (Whisper)", value=True) 
-    enable_text = st.sidebar.checkbox("Text Analysis (BERT+CLIP)", value=True)
-    
-    if not any([enable_video, enable_audio, enable_text]):
-        st.sidebar.error("Please enable at least one analysis method")
-    
-    # Fusion method selection
-    st.sidebar.header("Fusion Method")
-    fusion_method = st.sidebar.selectbox(
-        "How to combine results",
-        ["Weighted Average", "Maximum Confidence", "Consensus Voting", "Advanced Fusion"],
-        index=3,
-        help="Method for combining results from different modalities"
-    )
-    
-    # File upload
-    uploaded_file = st.file_uploader(
-        "Choose a video file",
-        type=['mp4', 'avi', 'mov', 'mkv'],
-        help="Upload a video file (max 30 seconds, 100MB)"
-    )
-    
-    if uploaded_file is not None:
-        # Check file size
-        file_size_mb = uploaded_file.size / (1024*1024)
-        if file_size_mb > 100:
-            st.error("File size too large. Please upload a video smaller than 100MB.")
-            return
+    def __init__(self):
+        """Initialize the application."""
+        self.model = None
+        self.device = None
+        self.video_processor = None
+        self.audio_processor = None
+        self.model_loaded = False
         
-        # Save file temporarily to check duration
-        with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
-            tmp_file.write(uploaded_file.read())
-            tmp_file_path = tmp_file.name
+        # Initialize session state
+        if 'processing_complete' not in st.session_state:
+            st.session_state.processing_complete = False
+        if 'prediction_result' not in st.session_state:
+            st.session_state.prediction_result = None
+        if 'transcript_text' not in st.session_state:
+            st.session_state.transcript_text = ""
+    
+    def load_model(self) -> bool:
+        """
+        Load the trained model.
+        
+        Returns:
+            True if model loaded successfully, False otherwise
+        """
+        if self.model_loaded:
+            return True
         
         try:
-            # Check video duration
-            duration = get_video_duration(tmp_file_path)
+            # Set device
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             
-            if duration > max_duration:
-                st.error(f"Video duration ({duration:.1f}s) exceeds maximum allowed ({max_duration}s). Please upload a shorter video.")
-                os.unlink(tmp_file_path)
+            # Create model
+            model_config = get_model_config()
+            self.model = create_model(model_config)
+            
+            # Load trained weights
+            model_path = config.MODEL_OUTPUT_DIR / "hybrid_deepfake_detector_best.pth"
+            
+            if not model_path.exists():
+                st.error(f"Trained model not found at {model_path}")
+                st.error("Please train the model first using the training script.")
+                return False
+            
+            # Load checkpoint
+            checkpoint_manager = ModelCheckpoint(str(config.MODEL_OUTPUT_DIR))
+            checkpoint = checkpoint_manager.load_checkpoint(
+                model=self.model,
+                checkpoint_path=str(model_path)
+            )
+            
+            self.model.to(self.device)
+            self.model.eval()
+            
+            # Initialize processors
+            self.video_processor = VideoProcessor()
+            self.audio_processor = AudioProcessor(model_name=config.WHISPER_MODEL)
+            
+            self.model_loaded = True
+            logger.info("Model loaded successfully")
+            return True
+            
+        except Exception as e:
+            st.error(f"Error loading model: {str(e)}")
+            logger.error(f"Error loading model: {e}")
+            return False
+    
+    def process_video(self, video_file, progress_bar, status_text) -> Tuple[Optional[torch.Tensor], Optional[str]]:
+        """
+        Process uploaded video file.
+        
+        Args:
+            video_file: Uploaded video file
+            progress_bar: Streamlit progress bar
+            status_text: Streamlit status text element
+            
+        Returns:
+            Tuple of (processed_frames, transcript_text)
+        """
+        try:
+            # Save uploaded file to temporary location
+            with tempfile.NamedTemporaryFile(delete=False, suffix='.mp4') as tmp_file:
+                tmp_file.write(video_file.read())
+                temp_video_path = tmp_file.name
+            
+            # Update progress
+            progress_bar.progress(10)
+            status_text.markdown('<div class="processing-step">📹 Extracting frames from video...</div>', 
+                               unsafe_allow_html=True)
+            
+            # Extract frames
+            frames = self.video_processor.extract_frames(
+                temp_video_path, 
+                fps=config.FRAMES_PER_SECOND
+            )
+            
+            if not frames:
+                st.error("No frames could be extracted from the video.")
+                return None, None
+            
+            progress_bar.progress(30)
+            status_text.markdown('<div class="processing-step">👤 Detecting and cropping faces...</div>', 
+                               unsafe_allow_html=True)
+            
+            # Process frames to extract faces
+            processed_frames = []
+            for frame in frames:
+                faces = self.video_processor.detect_and_crop_faces(
+                    frame, 
+                    target_size=(config.IMAGE_SIZE, config.IMAGE_SIZE)
+                )
+                if faces:
+                    # Use the first detected face
+                    processed_frames.append(faces[0])
+            
+            if not processed_frames:
+                st.error("No faces detected in the video.")
+                return None, None
+            
+            progress_bar.progress(50)
+            status_text.markdown('<div class="processing-step">🎵 Transcribing audio...</div>', 
+                               unsafe_allow_html=True)
+            
+            # Transcribe audio
+            transcription_data = self.audio_processor.transcribe_video(temp_video_path)
+            transcript_text = transcription_data.get('text', '')
+            
+            progress_bar.progress(70)
+            status_text.markdown('<div class="processing-step">🔄 Preparing data for model...</div>', 
+                               unsafe_allow_html=True)
+            
+            # Convert frames to tensor
+            frame_tensors = []
+            for frame in processed_frames[:config.MAX_FRAMES if hasattr(config, 'MAX_FRAMES') else 10]:
+                # Convert BGR to RGB
+                frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                # Convert to PIL Image
+                pil_image = Image.fromarray(frame_rgb)
+                # Apply transforms (same as dataset)
+                transform = self._get_transform()
+                frame_tensor = transform(pil_image)
+                frame_tensors.append(frame_tensor)
+            
+            # Pad or truncate to fixed number of frames
+            max_frames = 10
+            while len(frame_tensors) < max_frames:
+                # Pad with black frames
+                black_frame = torch.zeros(3, config.IMAGE_SIZE, config.IMAGE_SIZE)
+                frame_tensors.append(black_frame)
+            
+            frame_tensors = frame_tensors[:max_frames]
+            
+            # Stack frames into tensor
+            frames_tensor = torch.stack(frame_tensors).unsqueeze(0)  # Add batch dimension
+            
+            progress_bar.progress(90)
+            
+            # Clean up temporary file
+            os.unlink(temp_video_path)
+            
+            return frames_tensor, transcript_text
+            
+        except Exception as e:
+            st.error(f"Error processing video: {str(e)}")
+            logger.error(f"Error processing video: {e}")
+            return None, None
+    
+    def _get_transform(self):
+        """Get image transform for preprocessing."""
+        from torchvision import transforms
+        
+        return transforms.Compose([
+            transforms.Resize((config.IMAGE_SIZE, config.IMAGE_SIZE)),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])
+        ])
+    
+    def predict(self, frames_tensor: torch.Tensor, transcript_text: str) -> Dict:
+        """
+        Make prediction using the loaded model.
+        
+        Args:
+            frames_tensor: Processed video frames
+            transcript_text: Transcribed text
+            
+        Returns:
+            Dictionary containing prediction results
+        """
+        try:
+            # Tokenize text
+            from transformers import DistilBertTokenizer
+            tokenizer = DistilBertTokenizer.from_pretrained('distilbert-base-uncased')
+            
+            # Handle empty text
+            if not transcript_text.strip():
+                transcript_text = "[EMPTY]"
+            
+            # Tokenize
+            encoding = tokenizer(
+                transcript_text,
+                truncation=True,
+                padding='max_length',
+                max_length=config.MAX_TEXT_LENGTH,
+                return_tensors='pt'
+            )
+            
+            text_data = {
+                'input_ids': encoding['input_ids'],
+                'attention_mask': encoding['attention_mask']
+            }
+            
+            # Move to device
+            frames_tensor = frames_tensor.to(self.device)
+            text_data = {k: v.to(self.device) for k, v in text_data.items()}
+            
+            # Make prediction
+            with torch.no_grad():
+                probability = self.model(frames_tensor, text_data)
+                probability = probability.squeeze().cpu().item()
+            
+            # Convert to prediction
+            prediction = "FAKE" if probability >= 0.5 else "REAL"
+            confidence = probability if probability >= 0.5 else (1 - probability)
+            
+            return {
+                'prediction': prediction,
+                'probability': probability,
+                'confidence': confidence,
+                'is_fake': probability >= 0.5
+            }
+            
+        except Exception as e:
+            st.error(f"Error making prediction: {str(e)}")
+            logger.error(f"Error making prediction: {e}")
+            return None
+    
+    def display_prediction(self, result: Dict):
+        """
+        Display prediction results.
+        
+        Args:
+            result: Prediction results dictionary
+        """
+        prediction = result['prediction']
+        confidence = result['confidence']
+        probability = result['probability']
+        
+        # Main prediction display
+        if result['is_fake']:
+            st.markdown(f'''
+            <div class="prediction-box fake-prediction">
+                🚨 DEEPFAKE DETECTED 🚨<br>
+                Confidence: {confidence:.1%}
+            </div>
+            ''', unsafe_allow_html=True)
+        else:
+            st.markdown(f'''
+            <div class="prediction-box real-prediction">
+                ✅ AUTHENTIC VIDEO ✅<br>
+                Confidence: {confidence:.1%}
+            </div>
+            ''', unsafe_allow_html=True)
+        
+        # Detailed metrics
+        col1, col2, col3 = st.columns(3)
+        
+        with col1:
+            st.metric("Prediction", prediction)
+        
+        with col2:
+            st.metric("Confidence", f"{confidence:.1%}")
+        
+        with col3:
+            st.metric("Raw Score", f"{probability:.3f}")
+        
+        # Confidence bar
+        st.subheader("Confidence Visualization")
+        
+        # Create confidence bar
+        if result['is_fake']:
+            color = "#dc3545"  # Red for fake
+            bar_value = probability
+        else:
+            color = "#28a745"  # Green for real
+            bar_value = 1 - probability
+        
+        st.markdown(f'''
+        <div style="background-color: #e9ecef; border-radius: 10px; padding: 5px;">
+            <div style="background-color: {color}; width: {bar_value*100}%; height: 20px; 
+                        border-radius: 10px; transition: width 0.3s ease;"></div>
+        </div>
+        <p style="text-align: center; margin-top: 5px;">
+            Real ← {probability:.3f} → Fake
+        </p>
+        ''', unsafe_allow_html=True)
+    
+    def run(self):
+        """Run the main Streamlit application."""
+        # Header
+        st.markdown('<h1 class="main-header">🔍 Hybrid Deepfake Detector</h1>', 
+                   unsafe_allow_html=True)
+        
+        st.markdown("""
+        <div style="text-align: center; margin-bottom: 2rem; color: #666;">
+            Upload a video to detect if it contains deepfake content using advanced AI analysis
+        </div>
+        """, unsafe_allow_html=True)
+        
+        # Sidebar
+        with st.sidebar:
+            st.header("ℹ️ About")
+            st.markdown("""
+            This application uses a hybrid deep learning model that analyzes both:
+            
+            **🎥 Visual Features**
+            - Face detection and analysis
+            - Frame-by-frame examination
+            - EfficientNet-B0 backbone
+            
+            **📝 Audio Features**
+            - Speech transcription
+            - Text analysis with DistilBERT
+            - Lip-sync detection
+            
+            **🔬 Model Details**
+            - Combines visual and textual modalities
+            - Trained on deepfake datasets
+            - Real-time processing capability
+            """)
+            
+            st.header("📋 Instructions")
+            st.markdown("""
+            1. Upload a video file (MP4, AVI, MOV, etc.)
+            2. Wait for processing to complete
+            3. View the prediction results
+            4. Check the transcribed text
+            """)
+            
+            # Model status
+            st.header("🤖 Model Status")
+            if self.load_model():
+                st.success("✅ Model loaded successfully")
+                st.info(f"Device: {self.device}")
+            else:
+                st.error("❌ Model not available")
                 return
-            
+        
+        # Main content
+        # File uploader
+        st.subheader("📁 Upload Video")
+        uploaded_file = st.file_uploader(
+            "Choose a video file",
+            type=['mp4', 'avi', 'mov', 'mkv', 'wmv'],
+            help="Upload a video file to analyze for deepfake content"
+        )
+        
+        if uploaded_file is not None:
             # Display video info
             st.subheader("📹 Uploaded Video")
+            
             col1, col2 = st.columns([2, 1])
             
             with col1:
+                # Display video
                 st.video(uploaded_file)
             
             with col2:
-                st.write(f"**Filename:** {uploaded_file.name}")
-                st.write(f"**Size:** {file_size_mb:.2f} MB")
-                st.write(f"**Duration:** {duration:.1f} seconds")
-                
-                enabled_models = []
-                if enable_video: enabled_models.append("Video")
-                if enable_audio: enabled_models.append("Audio") 
-                if enable_text: enabled_models.append("Text")
-                st.write(f"**Enabled Models:** {', '.join(enabled_models)}")
-                st.write(f"**Fusion Method:** {fusion_method}")
+                # Video details
+                st.write("**File Details:**")
+                st.write(f"Name: {uploaded_file.name}")
+                st.write(f"Size: {uploaded_file.size / (1024*1024):.1f} MB")
+                st.write(f"Type: {uploaded_file.type}")
             
-            # Analysis button
-            if st.button("🔍 Analyze Video", type="primary"):
-                if not any([enable_video, enable_audio, enable_text]):
-                    st.error("Please enable at least one analysis method")
+            # Process button
+            if st.button("🔍 Analyze Video", type="primary", use_container_width=True):
+                # Reset session state
+                st.session_state.processing_complete = False
+                st.session_state.prediction_result = None
+                st.session_state.transcript_text = ""
+                
+                # Processing section
+                st.subheader("⚙️ Processing Video")
+                
+                # Progress indicators
+                progress_bar = st.progress(0)
+                status_text = st.empty()
+                
+                # Process video
+                frames_tensor, transcript_text = self.process_video(
+                    uploaded_file, progress_bar, status_text
+                )
+                
+                if frames_tensor is not None and transcript_text is not None:
+                    # Make prediction
+                    status_text.markdown('<div class="processing-step">🧠 Running AI analysis...</div>', 
+                                       unsafe_allow_html=True)
+                    progress_bar.progress(95)
+                    
+                    result = self.predict(frames_tensor, transcript_text)
+                    
+                    if result:
+                        progress_bar.progress(100)
+                        status_text.markdown('<div class="processing-step step-complete">✅ Analysis complete!</div>', 
+                                           unsafe_allow_html=True)
+                        
+                        # Store results in session state
+                        st.session_state.processing_complete = True
+                        st.session_state.prediction_result = result
+                        st.session_state.transcript_text = transcript_text
+                        
+                        # Small delay for better UX
+                        time.sleep(1)
+                        st.rerun()
+                    else:
+                        status_text.markdown('<div class="processing-step step-error">❌ Analysis failed</div>', 
+                                           unsafe_allow_html=True)
                 else:
-                    api_result = analyze_video_api(
-                        tmp_file_path, 
-                        enable_video, 
-                        enable_audio, 
-                        enable_text, 
-                        confidence_threshold, 
-                        fusion_method
+                    status_text.markdown('<div class="processing-step step-error">❌ Video processing failed</div>', 
+                                       unsafe_allow_html=True)
+        
+        # Display results if processing is complete
+        if st.session_state.processing_complete and st.session_state.prediction_result:
+            st.subheader("🎯 Analysis Results")
+            
+            # Display prediction
+            self.display_prediction(st.session_state.prediction_result)
+            
+            # Display transcript
+            if st.session_state.transcript_text:
+                st.subheader("📝 Transcribed Audio")
+                
+                with st.expander("View Transcript", expanded=False):
+                    st.text_area(
+                        "Transcribed Text",
+                        value=st.session_state.transcript_text,
+                        height=150,
+                        disabled=True
                     )
                     
-                    if api_result:
-                        # Extract results from API response
-                        results = api_result.get('results', {}).get('modality_results', {})
-                        fused_results = {
-                            'confidence': api_result.get('confidence', 0.5),
-                            'consistency_score': api_result.get('results', {}).get('consistency_score', 0.5),
-                            'method': fusion_method
-                        }
-                        
-                        # Estimate analysis times
-                        analysis_times = {
-                            'video': results.get('video', {}).get('processing_time', 0),
-                            'audio': results.get('audio', {}).get('processing_time', 0),
-                            'text': results.get('text', {}).get('processing_time', 0)
-                        }
-                        fusion_time = api_result.get('analysis_time_seconds', 0) - sum(analysis_times.values())
-                        
-                        # Display results
-                        display_multimodal_results(
-                            results, 
-                            fused_results, 
-                            analysis_times, 
-                            fusion_time, 
-                            confidence_threshold, 
-                            fusion_method
-                        )
-                        
-                        # Save results for Chapter 4
-                        save_results_to_csv(tmp_file_path, results, fused_results, confidence_threshold)
+                    # Transcript stats
+                    word_count = len(st.session_state.transcript_text.split())
+                    char_count = len(st.session_state.transcript_text)
+                    
+                    col1, col2 = st.columns(2)
+                    with col1:
+                        st.metric("Word Count", word_count)
+                    with col2:
+                        st.metric("Character Count", char_count)
+            else:
+                st.info("No audio transcript available for this video.")
+            
+            # Reset button
+            if st.button("🔄 Analyze Another Video", use_container_width=True):
+                st.session_state.processing_complete = False
+                st.session_state.prediction_result = None
+                st.session_state.transcript_text = ""
+                st.rerun()
         
-        finally:
-            # Clean up
-            if os.path.exists(tmp_file_path):
-                os.unlink(tmp_file_path)
+        # Footer
+        st.markdown("---")
+        st.markdown("""
+        <div style="text-align: center; color: #666; font-size: 0.8rem;">
+            HybridDeepfakeDetector v1.0 | Built with Streamlit and PyTorch
+        </div>
+        """, unsafe_allow_html=True)
+
+def main():
+    """Main function to run the Streamlit app."""
+    try:
+        app = DeepfakeDetectorApp()
+        app.run()
+    except Exception as e:
+        st.error(f"Application error: {str(e)}")
+        logger.error(f"Application error: {e}")
 
 if __name__ == "__main__":
     main()

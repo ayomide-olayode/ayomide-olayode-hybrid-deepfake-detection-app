@@ -1,43 +1,81 @@
-# Ignore virtual environment
-venv/
-.env/
-.venv/
-ENV/
-env/
-
-# Byte-compiled / optimized / DLL files
+# Python
 __pycache__/
 *.py[cod]
 *$py.class
-
-# C extensions
 *.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
 
-# Jupyter Notebook checkpoints
+# PyTorch
+*.pth
+*.pt
+
+# Data directories (exclude large datasets)
+data/
+!data/.gitkeep
+
+# Output directories
+outputs/
+!outputs/.gitkeep
+!outputs/models/.gitkeep
+!outputs/predictions/.gitkeep
+
+# Jupyter Notebook
 .ipynb_checkpoints
 
-# PyInstaller
-dist/
-build/
-*.spec
+# Environment variables
+.env
+.venv
+env/
+venv/
+ENV/
+env.bak/
+venv.bak/
 
-# VS Code / PyCharm settings
+# IDE
 .vscode/
 .idea/
+*.swp
+*.swo
+*~
 
-# Logs and local files
-*.log
-*.tmp
-
-# System files
+# OS
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
 Thumbs.db
 
-# Ignore model cache or large artifacts
-model_cache/
-*.pt
-*.pth
-*.ckpt
+# Logs
+*.log
+logs/
 
-# Ignore data folders (if any)
-data/
+# Temporary files
+*.tmp
+*.temp
+temp/
+
+# Model checkpoints (keep only best models)
+checkpoints/
+wandb/
+
+# Streamlit
+.streamlit/
